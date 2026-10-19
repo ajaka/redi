@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
@@ -11,9 +11,13 @@ use tokio::{
     },
     sync::mpsc,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
-    common::types::{CmdAction, CmdType},
+    common::{
+        limits::{MAX_KEY_LENGTH, MAX_VALUE_LENGTH},
+        types::{CmdAction, CmdType},
+    },
     database::{
         conductor::Conductor,
         types::{DatabaseEvent, DatabaseResponse},
@@ -21,22 +25,36 @@ use crate::{
     network::types::ResponseSignal,
 };
 
-pub async fn listen(addr: &str) -> Result<()> {
-    let conductor = Arc::new(Conductor::init(10).await);
+pub async fn listen(addr: &str, cancel_token: CancellationToken) -> Result<()> {
+    let conductor = Arc::new(Conductor::init(10, cancel_token.clone()).await);
     let listener = TcpListener::bind(addr).await?;
     println!("listening on {}", listener.local_addr().unwrap());
     loop {
-        let (socket, _) = listener.accept().await?;
+        let cloned_token = cancel_token.clone();
+        let socket = tokio::select! {
+            biased;
+            _ = cloned_token.cancelled() => {
+                return Ok(())
+            },
+            result = listener.accept() => {
+                let (socket,_) = result?;
+                socket
+            },
+        };
         let cloned_conductor = conductor.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(socket, cloned_conductor).await {
+            if let Err(e) = handle_conn(socket, cloned_conductor, cloned_token).await {
                 eprint!("Error occured {}", e)
             }
         });
     }
 }
 
-async fn handle_conn(socket: TcpStream, conductor: Arc<Conductor>) -> Result<()> {
+async fn handle_conn(
+    socket: TcpStream,
+    conductor: Arc<Conductor>,
+    cancel_token: CancellationToken,
+) -> Result<()> {
     let (mut reader, mut writer) = socket.into_split();
     let action = get_action(&mut reader).await?;
     let (sender, receiver) = mpsc::channel(100);
@@ -89,7 +107,7 @@ async fn handle_conn(socket: TcpStream, conductor: Arc<Conductor>) -> Result<()>
             ttl,
             req_id,
         } => {
-            let event = DatabaseEvent::Set {
+            let event = DatabaseEvent::SetNX {
                 key,
                 value,
                 ttl,
@@ -101,7 +119,7 @@ async fn handle_conn(socket: TcpStream, conductor: Arc<Conductor>) -> Result<()>
                 conductor,
                 receiver,
                 writer,
-                &ResponseSignal::Set.to_bytes(),
+                &ResponseSignal::SetNx.to_bytes(),
             )
             .await?
         }
@@ -121,7 +139,7 @@ async fn handle_conn(socket: TcpStream, conductor: Arc<Conductor>) -> Result<()>
             .await?
         }
         CmdAction::Conn => {
-            handle_long_session(writer, reader, conductor, sender, receiver).await?;
+            handle_long_session(writer, reader, conductor, sender, receiver, cancel_token).await?;
         }
     }
     Ok(())
@@ -133,35 +151,51 @@ async fn handle_long_session(
     conductor: Arc<Conductor>,
     sender: mpsc::Sender<DatabaseResponse>,
     mut receiver: mpsc::Receiver<DatabaseResponse>,
+    cancel_token: CancellationToken,
 ) -> Result<()> {
+    let child_token = cancel_token.child_token();
+    let child_cancel_token = child_token.clone();
     tokio::spawn(async move {
         let mut buf = Vec::new();
         loop {
-            match receiver.try_recv() {
-                Ok(msg) => {
-                    let signal = match msg.resp_type {
-                        CmdType::Del => &ResponseSignal::Del.to_bytes(),
-                        CmdType::Get => &ResponseSignal::Get.to_bytes(),
-                        CmdType::Set => &ResponseSignal::Set.to_bytes(),
-                        CmdType::SetNx => &ResponseSignal::SetNx.to_bytes(),
-                    };
-                    buf.extend_from_slice(signal);
-                    buf.extend_from_slice(&msg.payload.to_bytes());
-                    if let Err(e) = writer.write_all(&buf).await {
-                        eprint!("Error whilst writing to client {}", e);
-                        break;
-                    }
-                }
-                Err(e) => match e {
-                    mpsc::error::TryRecvError::Empty => continue,
-                    _ => break,
+            let msg = tokio::select! {
+                biased;
+                msg = receiver.recv() => match msg {
+                    Some(msg) => msg,
+                    None => break,
                 },
+                _ = child_cancel_token.cancelled () => break,
             };
+            let signal = match msg.resp_type {
+                CmdType::Del => &ResponseSignal::Del.to_bytes(),
+                CmdType::Get => &ResponseSignal::Get.to_bytes(),
+                CmdType::Set => &ResponseSignal::Set.to_bytes(),
+                CmdType::SetNx => &ResponseSignal::SetNx.to_bytes(),
+            };
+            buf.extend_from_slice(signal);
+            buf.extend_from_slice(&msg.payload.to_bytes());
+            if let Err(e) = writer.write_all(&buf).await {
+                eprint!("Error whilst writing to client {}", e);
+                break;
+            }
+            buf.clear();
         }
     });
 
     loop {
-        let action = get_action(&mut reader).await?;
+        let action = tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => {
+                return Ok(())
+            },
+            action = get_action(&mut reader) => match action {
+                Ok(action) => action,
+                Err(e) => {
+                    child_token.cancel();
+                    return Err(e);
+                },
+            },
+        };
         let event = match action {
             CmdAction::Get { key, req_id } => DatabaseEvent::Get {
                 key,
@@ -236,19 +270,24 @@ async fn get_action(reader: &mut OwnedReadHalf) -> Result<CmdAction> {
         2 => read_sets(reader, SetType::SetNX).await,
         3 => parse_get_and_del(reader, GetDel::Get).await,
         4 => parse_get_and_del(reader, GetDel::Del).await,
+        5 => Ok(CmdAction::Conn),
         _ => Ok(CmdAction::Sentinel),
     }
 }
 
 async fn parse_get_and_del(reader: &mut OwnedReadHalf, action: GetDel) -> Result<CmdAction> {
-    let mut req_id_buf = [0u8; 2];
+    let mut req_id_buf = [0u8; 1];
     reader.read_exact(&mut req_id_buf).await?;
-    let req_id = u16::from_be_bytes(req_id_buf);
-    let mut key_length_buf = [0u8; 2];
-    reader.read_exact(&mut key_length_buf).await?;
-    let key_length = u16::from_be_bytes(key_length_buf) as usize;
-    let mut key = vec![0u8; key_length];
+    let req_id = req_id_buf[0];
+
+    let mut key_len_buf = [0u8; 2];
+    reader.read_exact(&mut key_len_buf).await?;
+    let key_len = u16::from_be_bytes(key_len_buf);
+    validate_key_len(key_len)?;
+
+    let mut key = vec![0u8; key_len as usize];
     reader.read_exact(&mut key).await?;
+
     let resp = match action {
         GetDel::Del => CmdAction::Del { key, req_id },
         GetDel::Get => CmdAction::Get { key, req_id },
@@ -257,22 +296,30 @@ async fn parse_get_and_del(reader: &mut OwnedReadHalf, action: GetDel) -> Result
 }
 
 async fn read_sets(reader: &mut OwnedReadHalf, action: SetType) -> Result<CmdAction> {
-    let mut req_id_buf = [0u8; 2];
+    let mut req_id_buf = [0u8; 1];
     reader.read_exact(&mut req_id_buf).await?;
-    let req_id = u16::from_be_bytes(req_id_buf);
-    let mut key_length_buf = [0u8; 2];
-    reader.read_exact(&mut key_length_buf).await?;
-    let key_length = u16::from_be_bytes(key_length_buf) as usize;
-    let mut value_length_buf = [0u8; 4];
-    reader.read_exact(&mut value_length_buf).await?;
-    let value_length = u32::from_be_bytes(value_length_buf) as usize;
-    let mut key = vec![0u8; key_length];
+    let req_id = req_id_buf[0];
+
+    let mut key_len_buf = [0u8; 2];
+    reader.read_exact(&mut key_len_buf).await?;
+    let key_len = u16::from_be_bytes(key_len_buf);
+    validate_key_len(key_len)?;
+
+    let mut value_len_buf = [0u8; 4];
+    reader.read_exact(&mut value_len_buf).await?;
+    let value_len = u32::from_be_bytes(value_len_buf);
+    validate_value_len(value_len)?;
+
+    let mut key = vec![0u8; key_len as usize];
     reader.read_exact(&mut key).await?;
-    let mut value = vec![0u8; value_length];
+
+    let mut value = vec![0u8; value_len as usize];
     reader.read_exact(&mut value).await?;
+
     let mut ttl_buf = [0u8; 16];
     reader.read_exact(&mut ttl_buf).await?;
     let ttl = u128::from_be_bytes(ttl_buf);
+
     let resp = match action {
         SetType::Set => CmdAction::Set {
             key,
@@ -288,4 +335,18 @@ async fn read_sets(reader: &mut OwnedReadHalf, action: SetType) -> Result<CmdAct
         },
     };
     Ok(resp)
+}
+
+fn validate_key_len(key_len: u16) -> Result<()> {
+    if key_len > MAX_KEY_LENGTH {
+        bail!("The client provided key exceeds set limits");
+    };
+    Ok(())
+}
+
+fn validate_value_len(value_len: u32) -> Result<()> {
+    if value_len > MAX_VALUE_LENGTH {
+        bail!("The client provided value exceeds set limits");
+    };
+    Ok(())
 }
