@@ -12,24 +12,24 @@ pub enum DatabaseEvent {
         value: Vec<u8>,
         ttl: u128,
         sender: Sender<DatabaseResponse>,
-        req_id: u16,
+        req_id: u8,
     },
     SetNX {
         key: Vec<u8>,
         value: Vec<u8>,
         ttl: u128,
         sender: Sender<DatabaseResponse>,
-        req_id: u16,
+        req_id: u8,
     },
     Get {
         key: Vec<u8>,
         sender: Sender<DatabaseResponse>,
-        req_id: u16,
+        req_id: u8,
     },
     Del {
         key: Vec<u8>,
         sender: Sender<DatabaseResponse>,
-        req_id: u16,
+        req_id: u8,
     },
 }
 
@@ -72,16 +72,16 @@ pub struct DatabaseResponse {
 pub enum DatabaseResponseEnum {
     SetResponse {
         ok: bool,
-        req_id: u16,
+        req_id: u8,
     },
     GetResponse {
         ok: bool,
         value: Vec<u8>,
-        req_id: u16,
+        req_id: u8,
     },
     DelResponse {
         ok: bool,
-        req_id: u16,
+        req_id: u8,
     },
 }
 
@@ -98,6 +98,7 @@ impl DatabaseResponseEnum {
                 let mut buf = Vec::new();
                 buf.extend_from_slice(&req_id.to_be_bytes());
                 buf.push(ok as u8);
+                buf.extend_from_slice(&(value.len() as u32).to_be_bytes());
                 buf.extend_from_slice(&value);
                 buf
             }

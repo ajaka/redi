@@ -1,11 +1,11 @@
 use std::{
     collections::HashMap,
-    ops::Add,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
-use tokio::sync::mpsc::{Receiver, Sender, error};
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     common::types::CmdType,
@@ -25,21 +25,28 @@ impl DB {
         Self { db: HashMap::new() }
     }
 
-    pub async fn init(mut self, mut recv: Receiver<DatabaseEvent>) {
+    pub async fn init(
+        mut self,
+        mut recv: Receiver<DatabaseEvent>,
+        cancel_token: CancellationToken,
+        id: usize,
+    ) {
+        println!("Database shard with id {} is starting", id);
         tokio::spawn(async move {
             loop {
-                match recv.try_recv() {
-                    Ok(e) => {
-                        if let Err(e) = self.handle_event(e).await {
-                            eprintln!("An Error occured {}", e)
-                        }
-                    }
-                    Err(e) => match e {
-                        error::TryRecvError::Empty => continue,
-                        _ => {
-                            eprintln!("An Error occured {}", e)
-                        }
+                let event = tokio::select! {
+                    biased;
+                    msg = recv.recv() => match msg {
+                        Some(event) => event,
+                        None => break,
                     },
+                    _ = cancel_token.cancelled() => {
+                        println!("Database shard {} shutting down", id);
+                        break;
+                    },
+                };
+                if let Err(e) = self.handle_event(event).await {
+                    eprintln!("An Error occured {}", e)
                 }
             }
         });
@@ -80,9 +87,11 @@ impl DB {
         value: Vec<u8>,
         ttl: u128,
         sender: Sender<DatabaseResponse>,
-        req_id: u16,
+        req_id: u8,
     ) -> Result<()> {
-        let resp = if self.db.contains_key(&key) {
+        let now = self.get_now()?;
+        let live = self.db.get(&key).is_some_and(|e| now < e.ttl);
+        let resp = if live {
             DatabaseResponse {
                 resp_type: CmdType::SetNx,
                 payload: DatabaseResponseEnum::SetResponse { ok: false, req_id },
@@ -108,8 +117,11 @@ impl DB {
         value: Vec<u8>,
         ttl: u128,
         sender: Sender<DatabaseResponse>,
-        req_id: u16,
+        req_id: u8,
     ) -> Result<()> {
+        if ttl <= 0 {
+            return Ok(());
+        }
         let expires_in = self.get_expiry(ttl)?;
         let new_entry = Entry {
             value,
@@ -125,7 +137,7 @@ impl DB {
     }
 
     fn get_expiry(&self, ttl: u128) -> Result<u128> {
-        let exp = self.get_now()?.add(ttl);
+        let exp = self.get_now()?.saturating_add(ttl);
         Ok(exp)
     }
 
@@ -138,7 +150,7 @@ impl DB {
         &mut self,
         key: Vec<u8>,
         sender: Sender<DatabaseResponse>,
-        req_id: u16,
+        req_id: u8,
     ) -> Result<()> {
         let resp = match self.db.remove(&key) {
             Some(_) => DatabaseResponse {
@@ -157,7 +169,7 @@ impl DB {
         &mut self,
         key: Vec<u8>,
         sender: Sender<DatabaseResponse>,
-        req_id: u16,
+        req_id: u8,
     ) -> Result<()> {
         let resp = match self.db.get(&key) {
             None => DatabaseResponse {

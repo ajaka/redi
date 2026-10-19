@@ -2,6 +2,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 
 use anyhow::Result;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::database::{
     db::DB,
@@ -14,11 +15,11 @@ pub struct Conductor {
 }
 
 impl Conductor {
-    pub async fn init(num_of_shards: usize) -> Self {
+    pub async fn init(num_of_shards: usize, cancel_token: CancellationToken) -> Self {
         let mut shards = Vec::new();
-        for _ in 0..num_of_shards {
+        for n in 1..=num_of_shards {
             let (sender, receiver) = mpsc::channel(100);
-            DB::new().init(receiver).await;
+            DB::new().init(receiver, cancel_token.clone(), n).await;
             shards.push(sender);
         }
         Self {

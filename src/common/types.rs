@@ -12,21 +12,21 @@ pub enum CmdAction {
         key: Vec<u8>,
         value: Vec<u8>,
         ttl: u128,
-        req_id: u16,
+        req_id: u8,
     },
     SetNX {
         key: Vec<u8>,
         value: Vec<u8>,
         ttl: u128,
-        req_id: u16,
+        req_id: u8,
     },
     Get {
         key: Vec<u8>,
-        req_id: u16,
+        req_id: u8,
     },
     Del {
         key: Vec<u8>,
-        req_id: u16,
+        req_id: u8,
     },
     Conn,
 }
