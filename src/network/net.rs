@@ -1,5 +1,3 @@
-// TBH, i look forward to seeing the next bullshit you will cookup this time hehe
-
 use std::sync::Arc;
 
 use anyhow::{Result, bail};

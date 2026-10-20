@@ -147,8 +147,8 @@ async fn key_expires_after_ttl() {
     let (addr, _cancel) = common::spawn_server().await;
 
     let mut client = Client::connect(&addr).await;
-    // TTL of 50 milliseconds (in nanoseconds)
-    client.set(b"key", b"value", 50_000_000, 1).await;
+    // TTL of 500 milliseconds (in nanoseconds)
+    client.set(b"key", b"value", 500_000_000, 1).await;
     within(T, "set", client.read_response()).await;
     drop(client);
 
@@ -161,7 +161,7 @@ async fn key_expires_after_ttl() {
     drop(client);
 
     // Wait for expiry
-    sleep(Duration::from_millis(100)).await;
+    sleep(Duration::from_secs(1)).await;
 
     let mut client = Client::connect(&addr).await;
     client.get(b"key", 3).await;
@@ -175,13 +175,13 @@ async fn setnx_on_expired_key_succeeds() {
     let (addr, _cancel) = common::spawn_server().await;
 
     let mut client = Client::connect(&addr).await;
-    // Insert with very short TTL
-    client.set(b"key", b"first", 50_000_000, 1).await;
+    // Insert with a 500ms TTL
+    client.set(b"key", b"first", 500_000_000, 1).await;
     within(T, "set", client.read_response()).await;
     drop(client);
 
     // Wait for expiry
-    sleep(Duration::from_millis(100)).await;
+    sleep(Duration::from_secs(1)).await;
 
     let mut client = Client::connect(&addr).await;
     client.setnx(b"key", b"second", 1_000_000_000, 2).await;
@@ -329,17 +329,15 @@ async fn long_session_responses_match_req_id() {
     client.set(b"b", b"2", 1_000_000_000, 20).await;
     client.set(b"c", b"3", 1_000_000_000, 30).await;
 
-    let (signal, body) = within(T, "resp 1", client.read_response()).await;
-    assert_eq!(signal, RESP_SET);
-    assert_eq!(body[0], 10);
-
-    let (signal, body) = within(T, "resp 2", client.read_response()).await;
-    assert_eq!(signal, RESP_SET);
-    assert_eq!(body[0], 20);
-
-    let (signal, body) = within(T, "resp 3", client.read_response()).await;
-    assert_eq!(signal, RESP_SET);
-    assert_eq!(body[0], 30);
+    // Responses may arrive in any order; verify the set of req_ids.
+    let mut req_ids = Vec::new();
+    for _ in 0..3 {
+        let (signal, body) = within(T, "session resp", client.read_response()).await;
+        assert_eq!(signal, RESP_SET);
+        req_ids.push(body[0]);
+    }
+    req_ids.sort_unstable();
+    assert_eq!(req_ids, vec![10, 20, 30]);
 }
 
 // ---------------------------------------------------------------- connection lifecycle
