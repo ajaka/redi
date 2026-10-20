@@ -1,3 +1,4 @@
+#[derive(Debug, PartialEq)]
 pub enum CmdType {
     Set = 1,
     SetNx = 2,

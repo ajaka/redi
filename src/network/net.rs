@@ -25,7 +25,11 @@ use crate::{
     network::types::ResponseSignal,
 };
 
-pub async fn listen(addr: &str, cancel_token: CancellationToken) -> Result<()> {
+pub async fn listen(cancel_token: CancellationToken) -> Result<()> {
+    listen_on("127.0.0.1:6380", cancel_token).await
+}
+
+pub async fn listen_on(addr: &str, cancel_token: CancellationToken) -> Result<()> {
     let conductor = Arc::new(Conductor::init(10, cancel_token.clone()).await);
     let listener = TcpListener::bind(addr).await?;
     println!("listening on {}", listener.local_addr().unwrap());
