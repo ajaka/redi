@@ -1,6 +1,6 @@
 # redi
 
-[![CI](https://github.com/ajakash/redi/actions/workflows/ci.yml/badge.svg)](https://github.com/ajakash/redi/actions/workflows/ci.yml)
+[![CI](https://github.com/ajaka/redi/actions/workflows/ci.yml/badge.svg)](https://github.com/ajakash/redi/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust Edition](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](Cargo.toml)
 
