@@ -247,7 +247,10 @@ async fn dispatch_quick(
     let mut buf = Vec::new();
     buf.extend_from_slice(signal);
     conductor.dispatch(e).await?;
-    let resp = recv.recv().await.unwrap();
+    let resp = match recv.recv().await {
+        Some(resp) => resp,
+        None => bail!("Could not get response from database"),
+    };
     buf.extend_from_slice(&resp.payload.to_bytes());
     writer.write_all(&buf).await?;
     Ok(())
