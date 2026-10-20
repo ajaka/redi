@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -17,12 +17,14 @@ struct Entry {
     ttl: u128,
 }
 pub struct DB {
-    db: HashMap<Vec<u8>, Entry>,
+    db: BTreeMap<Vec<u8>, Entry>,
 }
 
 impl DB {
     pub fn new() -> Self {
-        Self { db: HashMap::new() }
+        Self {
+            db: BTreeMap::new(),
+        }
     }
 
     pub async fn init(
@@ -120,8 +122,15 @@ impl DB {
         req_id: u8,
     ) -> Result<()> {
         if ttl <= 0 {
+            sender
+                .send(DatabaseResponse {
+                    resp_type: CmdType::Set,
+                    payload: DatabaseResponseEnum::SetResponse { ok: false, req_id },
+                })
+                .await?;
             return Ok(());
         }
+
         let expires_in = self.get_expiry(ttl)?;
         let new_entry = Entry {
             value,

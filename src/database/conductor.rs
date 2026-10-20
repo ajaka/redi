@@ -1,8 +1,7 @@
-use std::hash::{DefaultHasher, Hash, Hasher};
-
 use anyhow::Result;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::database::{
     db::DB,
@@ -28,15 +27,14 @@ impl Conductor {
         }
     }
     fn hash(&self, key: &Vec<u8>) -> usize {
-        let mut h = DefaultHasher::new();
-        key.hash(&mut h);
-        (h.finish() % (self.shard_count as u64)) as usize
+        let hash128 = xxh3_64(key);
+        (hash128 % self.shard_count as u64) as usize
     }
 
     pub async fn dispatch(&self, e: DatabaseEvent) -> Result<()> {
         let key = e.get_key();
         let index = self.hash(key);
-        self.shards[index].send(e).await?;
+        self.shards[index].clone().send(e).await?;
         Ok(())
     }
 }
