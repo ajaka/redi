@@ -171,8 +171,10 @@ impl Client {
 /// cancel token that stops the server when cancelled.
 ///
 /// Binds a temporary listener to get a free port from the OS, then starts
-/// the server on that port. There is a small race between dropping the
-/// temporary listener and the server binding, but it's acceptable for tests.
+/// the server on that port. The server reports any bind or initialization
+/// error through a oneshot channel instead of discarding it, and readiness
+/// is confirmed by polling `TcpStream::connect` until the server accepts a
+/// connection or a bounded timeout expires.
 pub async fn spawn_server() -> (String, CancellationToken) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind temp");
     let port = listener.local_addr().expect("addr").port();
@@ -183,12 +185,31 @@ pub async fn spawn_server() -> (String, CancellationToken) {
     let server_cancel = cancel.clone();
     let server_addr = addr.clone();
 
+    let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
     tokio::spawn(async move {
-        let _ = listen_on(&server_addr, server_cancel).await;
+        let result = listen_on(&server_addr, server_cancel).await;
+        let _ = ready_tx.send(result.map_err(|e| e.to_string()));
     });
 
-    // Give the server a moment to bind.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Poll until the server accepts connections or a bounded timeout expires.
+    let startup = within(Duration::from_secs(5), "server startup", async {
+        loop {
+            match TcpStream::connect(&addr).await {
+                Ok(_) => return Ok(()),
+                Err(_) => {
+                    if let Ok(Err(msg)) = ready_rx.try_recv() {
+                        return Err(msg);
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+    })
+    .await;
+
+    if let Err(msg) = startup {
+        panic!("server failed to start: {msg}");
+    }
 
     (addr, cancel)
 }
